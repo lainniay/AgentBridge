@@ -1,0 +1,30 @@
+{
+  "agentbridge": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./bin/agentbridge hook pre-invocation",
+        "timeout": 1
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^((.+[._:/-])?bridge_[a-z0-9_]+|call_mcp_tool)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/agentbridge hook pre-tool-use",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./bin/agentbridge hook stop",
+        "timeout": 1
+      }
+    ]
+  }
+}

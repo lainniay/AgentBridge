@@ -1,0 +1,5 @@
+{
+  "name": "agentbridge",
+  "displayName": "AgentBridge",
+  "description": "Bind Antigravity and Codex sessions to a shared local blackboard."
+}
