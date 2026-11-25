@@ -28,6 +28,7 @@ type item struct {
 	Type    string          `json:"type"`
 	Phase   string          `json:"phase"`
 	Status  string          `json:"status"`
+	Text    string          `json:"text"`
 	Content json.RawMessage `json:"content"`
 	Changes json.RawMessage `json:"changes"`
 }
@@ -64,6 +65,7 @@ type turn struct {
 	finalEmitted bool
 	internal     bool
 	files        map[string]struct{}
+	plan         string
 	final        parsedEntry
 	legacyFinal  parsedEntry
 }
@@ -161,6 +163,14 @@ func (p *parser) line(line []byte, offset int64, existing bool) []parsedEntry {
 				if data.Item.Status == "" || data.Item.Status == "completed" {
 					t.addChanges(data.Item.Changes)
 				}
+			case "Plan", "plan", "ProposedPlan", "proposed_plan":
+				text := strings.TrimSpace(data.Item.Text)
+				if text == "" {
+					text = strings.TrimSpace(messageText(data.Item.Content))
+				}
+				if text != "" {
+					t.plan = text
+				}
 			}
 		case "patch_apply_end":
 			t.addChanges(data.Changes)
@@ -257,6 +267,13 @@ func (t *turn) complete(lastAgent string, ts time.Time, existing bool) []parsedE
 	}
 	if strings.TrimSpace(result.entry.Content) == "" {
 		result = t.legacyFinal
+	}
+	if t.plan != "" {
+		if strings.TrimSpace(result.entry.Content) == "" {
+			result = t.entry("assistant", t.plan, ts, existing)
+		} else if !strings.Contains(result.entry.Content, t.plan) {
+			result.entry.Content = strings.TrimSpace(result.entry.Content) + "\n\n" + t.plan
+		}
 	}
 	if strings.TrimSpace(result.entry.Content) == "" {
 		return nil

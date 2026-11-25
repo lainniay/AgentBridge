@@ -289,3 +289,65 @@ func TestFallbackTitleAndImmutableSummaryFallback(t *testing.T) {
 		t.Fatalf("got sessions %+v, want only here-unindexed with fallback title", sessions)
 	}
 }
+
+func TestCapturePlanArtifactAndTerminalStepStop(t *testing.T) {
+	root := t.TempDir()
+	planPath := filepath.Join(root, "plan-conv", "implementation_plan.md")
+	if err := os.MkdirAll(filepath.Dir(planPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	diskPlan := "# Implementation Plan\n\n1. Update parser\n2. Add tests\n"
+	if err := os.WriteFile(planPath, []byte(diskPlan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Turn 1: write_file with double-encoded string args + RequestFeedback=true, followed by a brief prose reply.
+	// Turn 2: plan written via write_file with no trailing prose reply, stopped with TERMINAL_STEP_TYPE (inline Content fallback when file missing).
+	missingPlan := filepath.Join(root, "plan-conv", "draft_plan.md")
+	raw := strings.Join([]string{
+		`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-20T12:00:00Z","content":"<USER_REQUEST>\n/plan 实现同步功能\n</USER_REQUEST>"}`,
+		`{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-20T12:00:05Z","tool_calls":[{"name":"write_file","args":{"Path":"` + strings.ReplaceAll(`"`+planPath+`"`, `"`, `\"`) + `","Content":"old draft","ArtifactMetadata":{"RequestFeedback":true,"UserFacing":true,"Summary":"Plan"}}}]}`,
+		`{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-20T12:00:06Z","content":"方案已写入，请审阅。"}`,
+		`{"step_index":3,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-20T12:01:00Z","content":"/plan 仅生成计划文件"}`,
+		`{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-20T12:01:05Z","tool_calls":[{"name":"write_file","args":{"Path":"` + missingPlan + `","Content":"# Draft Plan\n- Step A","ArtifactMetadata":{"RequestFeedback":true}}}]}`,
+	}, "\n") + "\n"
+
+	transcript := writeFixture(t, root, "plan-conv", []byte(raw))
+	a := New(root)
+
+	entries, err := a.ReadHistory("plan-conv", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("got %d entries, want 4: %+v", len(entries), entries)
+	}
+	if !strings.Contains(entries[1].Content, "方案已写入，请审阅。") || !strings.Contains(entries[1].Content, "[Plan: implementation_plan.md]\n# Implementation Plan") {
+		t.Fatalf("turn 1 assistant missing merged disk plan: %q", entries[1].Content)
+	}
+	if strings.Contains(entries[1].Content, "old draft") {
+		t.Fatalf("turn 1 should prefer latest on-disk plan over initial draft: %q", entries[1].Content)
+	}
+	if entries[3].Role != "assistant" || entries[3].Content != "[Plan: draft_plan.md]\n# Draft Plan\n- Step A" {
+		t.Fatalf("turn 2 assistant should emit fallback inline plan: %+v", entries[3])
+	}
+
+	// Hook Stop with TERMINAL_STEP_TYPE should collect the plan-only turn, while USER_CANCELED stays rejected.
+	input := HookInput{
+		ConversationID:    "plan-conv",
+		TranscriptPath:    transcript,
+		LastUserInput:     "/plan 仅生成计划文件",
+		TerminationReason: "TERMINAL_STEP_TYPE",
+	}
+	if !input.IsCollectibleStop() {
+		t.Fatal("TERMINAL_STEP_TYPE should be collectible")
+	}
+	got, err := a.HookEntries(input)
+	if err != nil || len(got) != 2 || got[1].Content != "[Plan: draft_plan.md]\n# Draft Plan\n- Step A" {
+		t.Fatalf("TERMINAL_STEP_TYPE hook entries: %+v, err=%v", got, err)
+	}
+	input.TerminationReason = "USER_CANCELED"
+	if input.IsCollectibleStop() {
+		t.Fatal("USER_CANCELED must not be collectible")
+	}
+}

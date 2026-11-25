@@ -34,6 +34,12 @@ func (input HookInput) IsInitialInvocation() bool {
 	return input.InvocationNum == nil || *input.InvocationNum <= 1
 }
 
+// IsCollectibleStop reports whether a Stop event completed cleanly (including
+// plan/feedback terminal steps, while excluding USER_CANCELED and ERROR).
+func (input HookInput) IsCollectibleStop() bool {
+	return input.TerminationReason == "NO_TOOL_CALL" || input.TerminationReason == "TERMINAL_STEP_TYPE"
+}
+
 // MatchesWorkspace checks workspace metadata when the host supplies it. A CWD
 // beneath the bound root also identifies the workspace when roots are absent.
 func (input HookInput) MatchesWorkspace(workspace string) bool {
@@ -111,7 +117,7 @@ func (a *Adapter) HookFinal(input HookInput) (blackboard.Entry, error) {
 // HookEntries recovers a missing user record together with the final reply.
 // Both records share the transcript's native turn identity.
 func (a *Adapter) HookEntries(input HookInput) ([]blackboard.Entry, error) {
-	if input.TerminationReason != "NO_TOOL_CALL" {
+	if !input.IsCollectibleStop() {
 		return nil, nil
 	}
 	path, err := a.hookPath(input)

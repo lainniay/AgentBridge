@@ -351,3 +351,52 @@ func TestSessionIndexThreadNameAndSubagentFiltering(t *testing.T) {
 		}
 	}
 }
+
+func TestCapturePlanItemsAndDeduplication(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	sessionsRoot := filepath.Join(home, "sessions", "2026", "11", "20")
+	if err := os.MkdirAll(sessionsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"timestamp":"2026-11-20T10:00:00Z","type":"session_meta","payload":{"id":"plan-thread","cwd":"/project/example"}}`,
+		// Turn 1: Plan item only (no separate final_answer).
+		`{"timestamp":"2026-11-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}`,
+		`{"timestamp":"2026-11-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"/plan 设计方案"}}`,
+		`{"timestamp":"2026-11-20T10:00:02Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"Plan","text":"# Plan 1\n1. Do A\n2. Do B"}}}`,
+		`{"timestamp":"2026-11-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}`,
+		// Turn 2: Short final_answer plus distinct Plan item -> both merged.
+		`{"timestamp":"2026-11-20T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t2"}}`,
+		`{"timestamp":"2026-11-20T10:01:01Z","type":"event_msg","payload":{"type":"user_message","message":"补充计划"}}`,
+		`{"timestamp":"2026-11-20T10:01:02Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t2","item":{"type":"proposed_plan","content":[{"type":"text","text":"# Plan 2\n- Step X"}]}}}`,
+		`{"timestamp":"2026-11-20T10:01:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"请确认以下计划："}]}}`,
+		`{"timestamp":"2026-11-20T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t2"}}`,
+		// Turn 3: final_answer already contains the plan text -> no duplication.
+		`{"timestamp":"2026-11-20T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t3"}}`,
+		`{"timestamp":"2026-11-20T10:02:01Z","type":"event_msg","payload":{"type":"user_message","message":"再输出一次"}}`,
+		`{"timestamp":"2026-11-20T10:02:02Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t3","item":{"type":"Plan","text":"# Plan 3\n- Same text"}}}`,
+		`{"timestamp":"2026-11-20T10:02:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"<proposed_plan>\n# Plan 3\n- Same text\n</proposed_plan>"}]}}`,
+		`{"timestamp":"2026-11-20T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t3"}}`,
+	}
+	if err := os.WriteFile(filepath.Join(sessionsRoot, "plan.jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := New("").ReadHistory("plan-thread", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 6 {
+		t.Fatalf("got %d entries, want 6: %+v", len(entries), entries)
+	}
+	if entries[1].Role != "assistant" || entries[1].Content != "# Plan 1\n1. Do A\n2. Do B" {
+		t.Fatalf("turn 1 assistant = %+v", entries[1])
+	}
+	if entries[3].Role != "assistant" || entries[3].Content != "请确认以下计划：\n\n# Plan 2\n- Step X" {
+		t.Fatalf("turn 2 assistant = %+v", entries[3])
+	}
+	if entries[5].Role != "assistant" || strings.Count(entries[5].Content, "# Plan 3") != 1 {
+		t.Fatalf("turn 3 assistant should deduplicate plan text: %q", entries[5].Content)
+	}
+}

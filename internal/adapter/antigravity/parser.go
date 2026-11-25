@@ -2,6 +2,7 @@ package antigravity
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/lainniay/AgentBridge/internal/blackboard"
 )
+
+const maxPlanBytes = 16 << 10
 
 type step struct {
 	Index     *int   `json:"step_index"`
@@ -43,10 +46,17 @@ func (s step) user() bool {
 
 func stepID(index int) string { return "step:" + strconv.Itoa(index) }
 
+type planArtifact struct {
+	path    string
+	content string
+}
+
 type turn struct {
 	user      blackboard.Entry
 	assistant blackboard.Entry
 	files     map[string]struct{}
+	plans     []planArtifact
+	lastTS    time.Time
 	lastIndex *int
 }
 
@@ -85,6 +95,9 @@ func (t *turn) accept(s step) {
 	if s.Status != "" && s.Status != "DONE" {
 		return
 	}
+	if ts, err := time.Parse(time.RFC3339Nano, s.CreatedAt); err == nil {
+		t.lastTS = ts
+	}
 	if len(s.ToolCalls) > 0 {
 		for _, call := range s.ToolCalls {
 			t.noteEdits(call.Name, call.Args)
@@ -102,6 +115,20 @@ func (t *turn) accept(s step) {
 
 func (t *turn) final() blackboard.Entry {
 	result := t.assistant
+	planText := t.renderPlans(result.Content)
+	if planText != "" {
+		if result.NativeTurnID == "" {
+			result = blackboard.Entry{
+				NativeTurnID: t.user.NativeTurnID,
+				Provider:     "antigravity",
+				Role:         "assistant",
+				TS:           t.lastTS,
+				Content:      planText,
+			}
+		} else {
+			result.Content = strings.TrimSpace(result.Content) + "\n\n" + planText
+		}
+	}
 	if result.NativeTurnID != "" {
 		for path := range t.files {
 			result.FilesTouched = append(result.FilesTouched, path)
@@ -109,6 +136,97 @@ func (t *turn) final() blackboard.Entry {
 		slices.Sort(result.FilesTouched)
 	}
 	return result
+}
+
+func (t *turn) renderPlans(existing string) string {
+	if len(t.plans) == 0 {
+		return ""
+	}
+	var sections []string
+	seen := make(map[string]struct{}, len(t.plans))
+	for _, p := range t.plans {
+		if _, dup := seen[p.path]; dup {
+			continue
+		}
+		seen[p.path] = struct{}{}
+		body := p.content
+		if data, err := os.ReadFile(p.path); err == nil {
+			body = string(data)
+		}
+		body = strings.TrimSpace(body)
+		if body == "" || strings.Contains(existing, body) {
+			continue
+		}
+		if len(body) > maxPlanBytes {
+			body = strings.TrimSpace(string([]rune(body)[:min(len([]rune(body)), maxPlanBytes/2)])) + "\n...(truncated)"
+		}
+		sections = append(sections, "[Plan: "+filepath.Base(p.path)+"]\n"+body)
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+func decodeArgString(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	// Antigravity transcripts sometimes store stringified JSON literals inside args.
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		var inner string
+		if json.Unmarshal([]byte(s), &inner) == nil {
+			return inner
+		}
+	}
+	return s
+}
+
+func isPlanFileName(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	return strings.HasSuffix(base, ".md") && strings.Contains(base, "plan")
+}
+
+func isPlanArtifact(path string, metaRaw json.RawMessage) bool {
+	hasMeta := false
+	requestFeedback := false
+	if len(metaRaw) > 0 && strings.TrimSpace(string(metaRaw)) != "null" {
+		raw := metaRaw
+		if raw[0] == '"' {
+			var inner string
+			if json.Unmarshal(raw, &inner) == nil {
+				raw = []byte(inner)
+			}
+		}
+		var meta struct {
+			RequestFeedback bool `json:"RequestFeedback"`
+		}
+		if json.Unmarshal(raw, &meta) == nil {
+			hasMeta = true
+			requestFeedback = meta.RequestFeedback
+		}
+	}
+	if requestFeedback {
+		return true
+	}
+	if !isPlanFileName(path) {
+		return false
+	}
+	if hasMeta {
+		return true
+	}
+	clean := filepath.ToSlash(filepath.Clean(path))
+	return strings.Contains(clean, "/.gemini/antigravity") && strings.Contains(clean, "/brain/")
+}
+
+func (t *turn) recordPlan(path, content string) {
+	for i := range t.plans {
+		if t.plans[i].path == path {
+			if content != "" {
+				t.plans[i].content = content
+			}
+			return
+		}
+	}
+	t.plans = append(t.plans, planArtifact{path: path, content: content})
 }
 
 func (t *turn) noteEdits(name string, raw json.RawMessage) {
@@ -128,16 +246,28 @@ func (t *turn) noteEdits(name string, raw json.RawMessage) {
 	if json.Unmarshal(raw, &args) != nil {
 		return
 	}
+	var primaryPath, content string
+	var artifactMeta json.RawMessage
 	for key, value := range args {
 		switch strings.ToLower(strings.ReplaceAll(key, "_", "")) {
 		case "path", "filepath", "targetfile", "targetfilepath", "sourcepath", "destinationpath", "oldpath", "newpath":
-			var path string
-			if json.Unmarshal(value, &path) == nil && strings.TrimSpace(path) != "" {
+			if path := strings.TrimSpace(decodeArgString(value)); path != "" {
+				clean := filepath.Clean(path)
 				if t.files == nil {
 					t.files = make(map[string]struct{})
 				}
-				t.files[filepath.Clean(path)] = struct{}{}
+				t.files[clean] = struct{}{}
+				if primaryPath == "" {
+					primaryPath = clean
+				}
 			}
+		case "content":
+			content = decodeArgString(value)
+		case "artifactmetadata":
+			artifactMeta = value
 		}
+	}
+	if primaryPath != "" && isPlanArtifact(primaryPath, artifactMeta) {
+		t.recordPlan(primaryPath, content)
 	}
 }

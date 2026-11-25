@@ -52,7 +52,7 @@ func hookResponse(in io.Reader, endpoint, event string) []byte {
 	}
 	if (event == "pre-tool-use" && !api.IsBridgeToolCall(input.ToolCall.Name, input.ToolCall.Args)) ||
 		(event == "pre-invocation" && !input.IsInitialInvocation()) ||
-		(event == "stop" && input.TerminationReason != "NO_TOOL_CALL") {
+		(event == "stop" && !input.IsCollectibleStop()) {
 		return empty
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/api/hooks/antigravity?event="+event, bytes.NewReader(raw))

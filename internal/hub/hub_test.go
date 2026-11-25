@@ -14,6 +14,7 @@ import (
 func TestReadModesEchoFilteringAndPersistence(t *testing.T) {
 	workspace := t.TempDir()
 	stateDir := filepath.Join(t.TempDir(), "state")
+	t.Setenv("AGENTBRIDGE_HOME", "")
 	t.Setenv("AGENTBRIDGE_STATE_DIR", stateDir)
 	h := openHub(t, "")
 	status, err := h.Status("", "")

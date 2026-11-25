@@ -431,7 +431,7 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "stop":
-		if input.TerminationReason == "NO_TOOL_CALL" {
+		if input.IsCollectibleStop() {
 			entries, err := s.agy.HookEntries(input)
 			if err == nil && len(entries) != 0 && r.Context().Err() == nil {
 				_ = s.hub.IngestEntries(room.ID, p.ID, entries)
